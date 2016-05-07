@@ -1,4 +1,4 @@
-<#
+﻿<#
     © 2015 Microsoft Corporation. All rights reserved. This sample code is not supported under any Microsoft standard support program or service. 
     This sample code is provided AS IS without warranty of any kind. Microsoft disclaims all implied warranties including, without limitation, 
     any implied warranties of merchantability or of fitness for a particular purpose. The entire risk arising out of the use or performance 
@@ -6,6 +6,8 @@
     production, or delivery of the scripts be liable for any damages whatsoever (including, without limitation, damages for loss of business 
     profits, business interruption, loss of business information, or other pecuniary loss) arising out of the use of or inability to use the 
     sample scripts or documentation, even if Microsoft has been advised of the possibility of such damages.
+
+    © 2016 Jakub Marsik
 #>
 
 
@@ -56,6 +58,12 @@
     <String[]> -WinRmCertificateName <String> -Deploy [<CommonParameters>]
 .EXAMPLE    
     Add-AzureSMVmToRM -VM <PersistentVMRoleContext> -ResourceGroupName <String> -DiskAction <Object> -OutputFileFolder <String> [-AppendTimeStampForFiles] -Deploy [<CommonParameters>]
+.EXAMPLE
+    $vm = Get-AzureVM -Name $name -ServiceName $name
+    Add-AzureSMVmToRM -VM $vm -ResourceGroupName Infra -DiskAction CopyDisks -OutputFileFolder .\Output\ -ForceTargetStorageAccountName lekiscmlstorrmlocal01 -ForceTargetVNetName Lekis-VNetRM-01b -ForceTargetSubnetName SRV-01 -ForceTargetSubnetAddressPrefix 10.127.2.0/24 -ForceTargetVNetIPAddress 10.127.2.8
+
+    Example with various Force... parameters to specify target storage account (can exist), virtual network (can exist), subnet (can exist), virtual network private IP address (must be compatible with selected subnet's address space).
+    Already existing target storage account and already existing target virtual network must be in the same resource group (specified by ResourceGroupName parameter).
 #>
 function Add-AzureSMVmToRM
 {
@@ -221,7 +229,7 @@ function Add-AzureSMVmToRM
         [Parameter(Mandatory=$false, ParameterSetName='VM object no custom certificate with files generated no deploy')]
         [Parameter(Mandatory=$false, ParameterSetName='VM object no custom certificate with files generated and deploy')]
         [Parameter(Mandatory=$false, ParameterSetName='VM object with custom certificate with files generated no deploy')]
-        [Parameter(Mandatory=$false, ParameterSetName='VM object with custom certificate with files generated and deploy')]     
+        [Parameter(Mandatory=$false, ParameterSetName='VM object with custom certificate with files generated and deploy')]
         [switch]
         $AppendTimeStampForFiles,
 
@@ -235,7 +243,22 @@ function Add-AzureSMVmToRM
         [Parameter(Mandatory=$true, ParameterSetName='VM object with custom certificate no files generated and deploy')]
         [Parameter(Mandatory=$true, ParameterSetName='VM object with custom certificate with files generated and deploy')]
         [switch]
-        $Deploy
+        $Deploy,
+
+        [string]
+        $ForceTargetStorageAccountName = $null,
+
+        [string]
+        $ForceTargetVNetName = $null,
+
+        [string]
+        $ForceTargetSubnetName = $null,
+
+        [string]
+        $ForceTargetSubnetAddressPrefix = $null,
+
+        [string]
+        $ForceTargetVNetIPAddress = $null
     )
 
     if ($psCmdlet.ParameterSetName -like "Service and VM names*")
@@ -261,9 +284,15 @@ function Add-AzureSMVmToRM
 
     if ($vm.PowerState -ne "Stopped")
     {
-        $vmMessage = "The VM {0} on service {1} needs to be stopped. It's power state is {2}" -f $vm.Name, $vm.ServiceName, $vm.PowerState
-        Write-Error $vmMessage
-        return
+        if ($Deploy)
+        {
+            $vmMessage = "Deployment is selected, the VM {0} on service {1} needs to be stopped. It's power state is {2}" -f $vm.Name, $vm.ServiceName, $vm.PowerState
+            Write-Error $vmMessage
+            return
+        }
+
+        $vmMessage = "Deployment is NOT selected, the VM {0} on service {1} can be running. But remember to turn it off before running generated scripts!" -f $vm.Name, $vm.ServiceName
+        Write-Warning $vmMessage
     }
 
     if ($WinRmCertificateName)
@@ -279,6 +308,19 @@ function Add-AzureSMVmToRM
 
     $cloudService = Get-AzureService -ServiceName $VM.ServiceName
     $location = $cloudService.Location
+
+    if ($location -eq $null)
+    {
+        # try to get location from affinity group
+        $affinityGroup = Get-AzureAffinityGroup -Name $cloudService.AffinityGroup -ErrorAction SilentlyContinue
+
+        if ($affinityGroup -eq $null)
+        {
+            throw ("Cannot determine location of cloud service {0}" -f $VM.ServiceName)
+        }
+
+        $location = $affinityGroup.Location
+    }
 
     $currentRmContext = Get-AzureRmContext -ErrorAction SilentlyContinue
     if ($currentRmContext -eq $null)
@@ -322,7 +364,14 @@ function Add-AzureSMVmToRM
     
     # Generate the storage account name for the ARM deployments. This function will test the existence of the account, and will generate a new name 
     # if the storage account exists on a different location.
-    $storageAccountName = Get-StorageAccountName -NamePrefix $canonicalSubscriptionName  -Location $location
+    if ($ForceTargetStorageAccountName -eq $null)
+    {
+        $storageAccountName = Get-StorageAccountName -NamePrefix $canonicalSubscriptionName -Location $location
+    }
+    else
+    {
+        $storageAccountName = $ForceTargetStorageAccountName
+    }
 
     # Check if we need to create storage account resource. 
     if (-not $(Test-AzureName -Storage $storageAccountName))
@@ -340,15 +389,19 @@ function Add-AzureSMVmToRM
     $virtualNetworkSite = $null
     $vmSumbnet = ''
     $networkConfiguration = $null
-    $classicSubnet = $null
+    $classicSubnetName = $null
+    $classicSubnetAddressPrefix = $null
     $privateIpAddress = $null
     $vmSubnetName = ""
 
     if ($VM.VirtualNetworkName -eq $null)
     {
         $vnetName = $Global:asm2armVnetName
+        $classicSubnetName = $Global:asm2armSubnet
+        $classicSubnetAddressPrefix = $Global:defaultSubnetAddressSpace
     } 
-    else {
+    else
+    {
         $vnetName = $(Get-CanonicalString $VM.VirtualNetworkName) + $Global:armSuffix
         # Wrapping in try-catch as the commandlet does not implement -ErrorAction SilentlyContinue
         try
@@ -364,11 +417,14 @@ function Add-AzureSMVmToRM
         if ($configuration.Count -gt 0)
         {
             $networkConfiguration = $configuration[0]
-            $subnetName = $networkConfiguration.SubnetNames[0]
-            $classicSubnet = $virtualNetworkSite.Subnets | Where-Object {$_.Name -eq $subnetName}
+            $classicSubnetName = $networkConfiguration.SubnetNames[0]
+            $classicSubnetAddressPrefix = ($virtualNetworkSite.Subnets | Where-Object {$_.Name -eq $subnetName}).AddressPrefix
             $privateIpAddress = $networkConfiguration.StaticVirtualNetworkIPAddress
         }
     }
+
+    if ($ForceTargetVNetName -ne $null) { $vnetName = $ForceTargetVNetName }
+    if ($ForceTargetVNetIPAddress -ne $null) { $privateIpAddress = $ForceTargetVNetIPAddress }
     
 	$currentVnet = Get-AzureRmVirtualNetwork -Name $vnetName -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue
     $subnets = @()
@@ -377,18 +433,27 @@ function Add-AzureSMVmToRM
     # Does the resource manager have a virtual network we can use? If we have null, no.
     if ($currentVnet -eq $null)
     {
-        # Does the source VM is on a virtual network? If the vnetname is the default virtual network name, that means no.
-        if ($vnetName -eq $Global:asm2armVnetName)
+        # Is the source VM on a virtual network?
+        if ($virtualNetworkSite -eq $null)
         {
             # If we are here, that means no virtual network on the source VM and no virtual network on the target resource group.
             # Cust create a default virtual network with a default subnet.
-            $vnetAddressSpaces += $Global:defaultAddressSpace
+            if ($classicSubnetName -eq $Global:asm2armSubnet)
+            {
+                $vnetAddressSpaces += $Global:defaultAddressSpace
+            }
+            else
+            {
+                $vnetAddressSpaces += $classicSubnetAddressPrefix
+            }
 
-            Write-Verbose $("Adding a resource definition for '{0}' subnet - new default subnet" -f $Global:asm2armSubnet)
+            Write-Verbose $("Adding a resource definition for '{0}' subnet (default subnet or forced)" -f $classicSubnetName)
 
-            $subnets += New-VirtualNetworkSubnet -Name $Global:asm2armSubnet -AddressPrefix $Global:defaultSubnetAddressSpace
-            $vmSubnetName = $Global:asm2armSubnet 
-        } else {
+            $subnets += New-VirtualNetworkSubnet -Name $classicSubnetName -AddressPrefix $classicSubnetAddressPrefix
+            $vmSubnetName = $classicSubnetName
+        }
+        else
+        {
             # The source VM is on a virtual network. Copy all of the virtual network to ARM
             Write-Verbose $("Copying the classic virtual network specification")
             foreach ($addressSpace in $virtualNetworkSite.AddressSpacePrefixes)
@@ -401,57 +466,50 @@ function Add-AzureSMVmToRM
                 Write-Verbose $("Adding a resource definition for '{0}' subnet" -f $subnet.Name)
                 $subnets += New-VirtualNetworkSubnet -Name $subnet.Name -AddressPrefix $subnet.AddressPrefix
             }
-            $vmSubnetName = $classicSubnet.Name 
+            $vmSubnetName = $classicSubnetName 
         }
     }
-    else {
-        # If we are here, that means we had previously made a cloning, or the virtual network we are trying to create exists.
-        # We need to create the exact copy of the existing virtual network specification, and add a new subnet if the target
-        # subnet does not exist.
+    else
+    {
+        # If we are here, that means the virtual network we are trying to create already exists.
+        # We will just try to find existing subnet with the same definition as the source subnet. If such subnet doesn't
+        # exist, we will try to create it.
+        # In such case let's hope that the address spaces of the target virtual network are correct and include the address
+        # space of the newly created subnet.
+
+        $targetVNetSubnetName = $classicSubnetName
+        if ($ForceTargetSubnetName -ne $null) { $targetVNetSubnetName = $ForceTargetSubnetName }
+        $targetVNetSubnetAddressPrefix = $classicSubnetAddressPrefix
+        if ($ForceTargetSubnetAddressPrefix -ne $null) { $targetVNetSubnetAddressPrefix = $ForceTargetSubnetAddressPrefix }
 
         $subnetExists = $false
         foreach ($subnet in $currentVnet.Subnets)
         {
-            $subnetExists = $($subnet.AddressPrefix -eq $classicSubnet.AddressPrefix -and $subnet.Name -eq $classicSubnet.Name)
-            if ($subnetExists)
+            if ($subnet.AddressPrefix -eq $targetVNetSubnetAddressPrefix -and $subnet.Name -eq $targetVNetSubnetName)
             {
-                foreach ($addressPrefix in $currentVnet.AddressSpace.AddressPrefixes)
-                {
-                    if (Test-SubnetInAddressSpace -SubnetPrefix $classicSubnet.AddressPrefix -AddressSpace $addressPrefix)
-                    {
-                        $vnetAddressSpaces += $addressPrefix
-                    }
-                }
+                # indicate for later that the subnet was found in existing target virtual network
+                $subnetExists = $true
 
-                $vmSubnetName = $classicSubnet.Name 
+                $vmSubnetName = $subnet.Name
             }
-            Write-Verbose $("Found a matching subnet, adding a resource definition for '{0}' subnet" -f $subnet.Name)
-            $subnets += New-VirtualNetworkSubnet -Name $subnet.Name -AddressPrefix $subnet.AddressPrefix
         }
 
         if (-not $subnetExists)
         {       
-            # We could not find a suitable subnet. This could be because a new VM that could be added after an initial
-            # cloning process for another VM. Let's find a suitable address space and add a new subnet
-            $existingSubnets = @()
-            $currentVnet.Subnets | ForEach-Object {$existingSubnets += $_.AddressPrefix}
-
-            $subnetAddressSpace = Get-AvailableAddressSpace $existingSubnets
-
             foreach ($addressPrefix in $currentVnet.AddressSpace.AddressPrefixes)
             {
-                if (Test-SubnetInAddressSpace -SubnetPrefix $subnetAddressSpace -AddressSpace $addressPrefix)
+                if (Test-SubnetInAddressSpace -SubnetPrefix $targetVNetSubnetAddressPrefix -AddressSpace $addressPrefix)
                 {
                     $vnetAddressSpaces += $addressPrefix
                 }
             }
 
-            $canonicalServiceName = Get-CanonicalString $vm.ServiceName
-            $canonicalVmName = Get-CanonicalString $vm.Name
-
-            $subnetName = 'subnet-{0}-{1}' -f $canonicalServiceName, $canonicalVmName            
+            # construct unique subnet name that doesn't exist in target virtual network, prefer the name of the source subnet
+            $subnetNameOrigin = $targetVNetSubnetName
+            $subnetName = $subnetNameOrigin
             $increment = 0
-            do {
+            do
+            {
                 $newName = $true
                 foreach($subnet in $currentVnet.Subnets)
                 {
@@ -462,21 +520,25 @@ function Add-AzureSMVmToRM
                 }
                 if (-not $newName)
                 {
-                    $subnetName = "{0}-{1:00}" -f $subnetName, $increment
+                    $subnetName = "{0}-{1:00}" -f $subnetNameOrigin, $increment
                     $increment += 1
                 }
             } until ($newName)
 
             Write-Verbose $("Could not find a matching subnet within the existing virtual network, adding the subnet '{0}'" -f $subnetName)
 
-            $subnets += New-VirtualNetworkSubnet -Name $subnetName -AddressPrefix $subnetAddressSpace
+            $subnets += New-VirtualNetworkSubnet -Name $subnetName -AddressPrefix $targetVNetSubnetAddressPrefix
             $vmSubnetName = $subnetName
         }
     }
 
-    Write-Verbose $("Adding a resource definition for '{0}' virtual network" -f $vnetName)
-    $vnetResource = New-VirtualNetworkResource -Name $vnetName -Location $resourceLocation -AddressSpacePrefixes $vnetAddressSpaces -Subnets $subnets
-    $setupResources += $vnetResource
+    if ($vnetAddressSpaces.Length -gt 0 -and $subnets.Length -gt 0)
+    {
+        Write-Verbose $("Adding a resource definition for '{0}' virtual network" -f $vnetName)
+
+        $vnetResource = New-VirtualNetworkResource -Name $vnetName -Location $resourceLocation -AddressSpacePrefixes $vnetAddressSpaces -Subnets $subnets
+        $setupResources += $vnetResource
+    }
 
     # Availability set resource
     if ($VM.AvailabilitySetName)
@@ -489,9 +551,11 @@ function Add-AzureSMVmToRM
 
     $actualParameters['location'] = $location
     $vmName = '{0}_{1}' -f $ServiceName, $Name
+    # for single role instance cloud services we can use just VM name
+    if (($cloudService | Get-AzureVM | Measure-Object).Count -eq 1) { $vmName = $Name }
 
     # Public IP Address resource
-    $ipAddressName = '{0}_armpublicip' -f $vmName
+    $ipAddressName = '{0}_pip' -f $vmName
 
     Write-Verbose $("Adding a resource definition for '{0}' public IP address" -f $ipAddressName)
 
@@ -500,16 +564,25 @@ function Add-AzureSMVmToRM
         -AllocationMethod 'Dynamic' -DnsName $armDnsName
     $resources += $publicIPAddressResource
     
+    # NSG resource
+    $nsgName = '{0}_nsg' -f $vmName
+
+    Write-Verbose $("Adding a resource definition for '{0}' network security group" -f $nsgName)
+
+    $nsgResource = New-NetworkSecurityGroupResource -Name $nsgName -Location $resourceLocation -Endpoints (Get-AzureVmEndpoints -VM $VM)
+    $resources += $nsgResource
+
     # NIC resource
     $nicName = '{0}_nic' -f $vmName
     $subnetRef = '[concat(resourceId(''Microsoft.Network/virtualNetworks'',''{0}''),''/subnets/{1}'')]' -f $vnetName, $vmSubnetName
     $ipAddressDependency = 'Microsoft.Network/publicIPAddresses/{0}' -f $ipAddressName
+    $nsgDependency = 'Microsoft.Network/networkSecurityGroups/{0}' -f $nsgName
     $vnetDependency = 'Microsoft.Network/virtualNetworks/{0}' -f $vnetName
 
     Write-Verbose $("Adding a resource definition for '{0}' network interface" -f $nicName)
 
-    $dependencies = @($ipAddressDependency)
-    $nicResource = New-NetworkInterfaceResource -Name $nicName -Location $resourceLocation -PublicIpAddressName $ipAddressName -PrivateIpAddress $privateIpAddress -SubnetReference $subnetRef -Dependencies $dependencies
+    $dependencies = @($ipAddressDependency, $nsgDependency)
+    $nicResource = New-NetworkInterfaceResource -Name $nicName -Location $resourceLocation -PublicIpAddressName $ipAddressName -PrivateIpAddress $privateIpAddress -SubnetReference $subnetRef -NetworkSecurityGroupName $nsgName -Dependencies $dependencies
     $resources += $nicResource
 
     # VM
@@ -578,34 +651,35 @@ function Add-AzureSMVmToRM
 
     if($Deploy.IsPresent)
     {
-        
         New-AzureSmToRMDeployment -ResourceGroupName $ResourceGroupName -Location $location -ServiceName $vm.ServiceName -Name $vm.Name `
             -SetupTemplateFileName $setupTemplateFileName -ParametersFileName $parametersFileName -DeployTemplateFileName $deployTemplateFileName `
             -CopyDisksScript $copyDisksScriptFileName -ImperativeScript $imperativeScript
-    } else {
-            $deployCommandletCall = 'New-AzureSmToRMDeployment -ResourceGroupName ''{0}'' -Location ''{1}'' -ServiceName ''{2}'' -Name ''{3}'' -StorageAccountName ''{4}''' `
-                            -f $ResourceGroupName, $location, $vm.ServiceName, $vm.Name, $storageAccountName
-            $deployCommandletCall += ' -SetupTemplateFileName ''{0}'' -ParametersFileName ''{1}'' -DeployTemplateFileName ''{2}'' ' `
-                                    -f $setupTemplateFileName, $parametersFileName, $deployTemplateFileName
-            if ($copyDisksScriptFileName -ne "")
-            {
-                $deployCommandletCall += ' -CopyDisksScript ''{0}''' -f $copyDisksScriptFileName
-            }
+    }
+    else
+    {
+        $deployCommandletCall = 'New-AzureSmToRMDeployment -ResourceGroupName ''{0}'' -Location ''{1}'' -ServiceName ''{2}'' -Name ''{3}'' -StorageAccountName ''{4}''' `
+                        -f $ResourceGroupName, $location, $vm.ServiceName, $vm.Name, $storageAccountName
+        $deployCommandletCall += ' -SetupTemplateFileName ''{0}'' -ParametersFileName ''{1}'' -DeployTemplateFileName ''{2}'' ' `
+                                -f $setupTemplateFileName, $parametersFileName, $deployTemplateFileName
+        if ($copyDisksScriptFileName -ne "")
+        {
+            $deployCommandletCall += ' -CopyDisksScript ''{0}''' -f $copyDisksScriptFileName
+        }
 
-            if ($imperativeScript -ne "")
-            {
-                $deployCommandletCall += ' -ImperativeScript ''{0}''' -f $imperativeScriptFileName
-            }
+        if ($imperativeScript -ne "")
+        {
+            $deployCommandletCall += ' -ImperativeScript ''{0}''' -f $imperativeScriptFileName
+        }
 
-            Write-Host "Run the following line to deploy the generated templates and scripts `r`n"
-            Write-Host $deployCommandletCall.Trim()
+        Write-Host "Run the following line to deploy the generated templates and scripts `r`n"
+        Write-Host $deployCommandletCall.Trim()
 
-            # Dumping the deploy command line
-            $deployScriptFileName = Join-Path -Path $OutputFileFolder -ChildPath $('{0}-deploy{1}.ps1' -f $fileNamePrefix, $timestamp)
-            Write-Verbose $("Generating deploy script file and writing output to {0}" -f $deployScriptFileName)
-            $deployCommandletCall | Out-File $deployScriptFileName -Force
+        # Dumping the deploy command line
+        $deployScriptFileName = Join-Path -Path $OutputFileFolder -ChildPath $('{0}-deploy{1}.ps1' -f $fileNamePrefix, $timestamp)
+        Write-Verbose $("Generating deploy script file and writing output to {0}" -f $deployScriptFileName)
+        $deployCommandletCall | Out-File $deployScriptFileName -Force
             
-            Write-Host $("Same commandline can also be found in {0}`r`n" -f $deployScriptFileName) 
+        Write-Host $("Same commandline can also be found in {0}`r`n" -f $deployScriptFileName) 
     }
 }
 
@@ -614,16 +688,10 @@ function Add-AzureSMVmToRM
    Clone (optionally) and deploy the VM using the generated scripts. THis is a part of asm2arm module, cannot be used by itself.
 .DESCRIPTION
    Add-AzureSMVmToRM generates the scripts and templates and this commandlet deploys the templates and runs the scripts for the deployment.
-.EXAMPLE
-   
-.EXAMPLE
-   
-
 #>
 function New-AzureSmToRMDeployment 
 {
-    [CmdletBinding(PositionalBinding=$false,
-                  ConfirmImpact='Medium')]
+    [CmdletBinding(PositionalBinding=$false, ConfirmImpact='Medium')]
     Param(
         # Resource group name for making the deployment
         [Parameter(Mandatory=$true)]
@@ -674,7 +742,6 @@ function New-AzureSmToRMDeployment
         [Parameter(Mandatory=$false)]
         [string]
         $ImperativeScript
-
     )
 
         $resourceGroup = Get-AzureRmResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue
@@ -741,7 +808,8 @@ function Start-HyperbolicWaitForStorageAccount
     $done = $false
     $waitFor = $startSeconds
     $iteration = 1
-    do {        
+    do
+    {        
         $storageAccount = Get-AzureRmStorageAccount -ResourceGroupName $resourceGroupName -Name $StorageAccountName -ErrorAction SilentlyContinue
         $done = $storageAccount -ne $null
         if (-not $done)
@@ -760,7 +828,6 @@ function Start-HyperbolicWaitForStorageAccount
             }
             $iteration += 1
         }
-        
     } while ($iteration -le 100 -and -not $done)
 
     if (-not $done)

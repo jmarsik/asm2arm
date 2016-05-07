@@ -327,8 +327,7 @@ function New-VmResource
 
     $properties.Add('hardwareProfile', @{'vmSize' = $(Get-AzureArmVmSize -Size $vm.VM.RoleSize)})
 
-    $properties.Add('networkProfile', @{'networkInterfaces' = @(@{'id' = '[resourceId(''Microsoft.Network/networkInterfaces'',''{0}'')]' -f $NetworkInterfaceName } ); `
-                                        'inputEndpoints' = Get-AzureVmEndpoints -VM $VM })
+    $properties.Add('networkProfile', @{ 'networkInterfaces' = @( @{ 'id' = '[resourceId(''Microsoft.Network/networkInterfaces'',''{0}'')]' -f $NetworkInterfaceName } ) } )
     
     $computeResourceProvider = "Microsoft.Compute/virtualMachines"
     $crpApiVersion = $Global:apiVersion        
@@ -487,15 +486,21 @@ function Get-AzureVmEndpoints
 		$VM
 	)
 
-    # Report all load balanced endpoints to the user so that they know that we do not currently handle these endpoints
+    # report all load balanced endpoints to the user so that they know that we do not currently handle these endpoints
     $VM | Get-AzureEndpoint | Where-Object {$_.LBSetName -ne $null} | ForEach-Object { Write-Warning $("Endpoint {0} is skipped as load balanced endpoints are NOT currently supported by this cmdlet. You can still manually recreate this endpoint in ARM using the following details: {1}" -f $_.Name, $(ConvertTo-Json $_)) }
 
+    # report all endpoints with different private and public port to the user so that they know that we do not currently handle these endpoints completely, we just create a hole in the firewall (NSG) for the public port
+    # correct structure to use would be the load balancer with NAT rules
+    $VM | Get-AzureEndpoint | Where-Object {$_.LocalPort -ne $_.Port} | ForEach-Object { Write-Warning $("Endpoint {0} is skipped because using different public port and private port is NOT currently supported by this cmdlet. You have to manually create the required structure in ARM (load balancer associated with the network interface, public IP address associated with the load balancer and NAT rules for mapping ports) using the following details: {1}" -f $_.Name, $(ConvertTo-Json $_)) }
+
     # Walk through all endpoints and filter those that are assigned to a load balancer set (we do not currently handle these endpoints)
-    return $VM | Get-AzureEndpoint | Where-Object {$_.LBSetName -eq $null} | Select-Object @{n='endpointName';e={$_.Name}},`
-                                                         @{n='privatePort';e={$_.LocalPort}},
-                                                         @{n='publicPort';e={$_.Port}},
-                                                         @{n='protocol';e={$_.Protocol}},
-                                                         @{n='enableDirectServerReturn';e={$_.EnableDirectServerReturn}}
+    return $VM | Get-AzureEndpoint | Where-Object {$_.LBSetName -eq $null} | Where-Object {$_.LocalPort -eq $_.Port} | `
+        Select-Object `
+            @{n='endpointName';e={$_.Name}},
+            @{n='privatePort';e={$_.LocalPort}},
+            @{n='publicPort';e={$_.Port}},
+            @{n='protocol';e={$_.Protocol}},
+            @{n='enableDirectServerReturn';e={$_.EnableDirectServerReturn}}
 }
 
 

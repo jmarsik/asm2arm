@@ -51,6 +51,35 @@ function New-VirtualNetworkSubnet
     return $subnet
 }
 
+function New-NetworkSecurityGroupResource
+{
+    Param
+    (
+        $Name,
+        $Location,
+        [array]
+        $Endpoints
+    )
+    
+    $securityRules = @()
+
+    $i = 1
+    $Endpoints | ForEach-Object -Process {
+        $nsgRule = @{'name' = $_.endpointName; 'properties' = @{'description' = $_.endpointName; 'protocol' = $_.protocol; `
+            'sourcePortRange' = '*'; 'destinationPortRange' = $_.publicPort.ToString(); 'sourceAddressPrefix' = 'Internet'; 'destinationAddressPrefix' = '*'; `
+            'access' = 'Allow'; 'priority' = ($i * 100); 'direction' = 'Inbound'}}
+        $securityRules += $nsgRule;
+        $i++
+    }
+
+    $createProperties = @{'securityRules' = $securityRules}
+
+    $resource = New-ResourceTemplate -Type "Microsoft.Network/networkSecurityGroups" -Name $Name `
+        -Location $Location -ApiVersion $Global:apiVersion -Properties $createProperties
+
+    return $resource
+}
+
 function New-NetworkInterfaceResource
 {
     Param
@@ -63,6 +92,8 @@ function New-NetworkInterfaceResource
         $PrivateIpAddress,
         [string]
         $PublicIpAddressName,
+        [string]
+        $NetworkSecurityGroupName,
         [string[]]
         $Dependencies
     )
@@ -88,7 +119,14 @@ function New-NetworkInterfaceResource
     }
 
     $ipConfigName = "{0}_config1" -f $Name
+
     $createProperties = @{'ipConfigurations' =  @(@{'name' =  $ipConfigName; 'properties' = $ipConfigurations;})}
+
+    if($NetworkSecurityGroupName)
+    {
+        $networkSecurityGroup = @{'id' = '[resourceId(''Microsoft.Network/networkSecurityGroups'',''{0}'')]' -f $NetworkSecurityGroupName;}
+        $createProperties.Add('networkSecurityGroup', $networkSecurityGroup);
+    }
 
     $resource = New-ResourceTemplate -Type "Microsoft.Network/networkInterfaces" -Name $Name `
         -Location $Location -ApiVersion $Global:apiVersion -Properties $createProperties -DependsOn $Dependencies
